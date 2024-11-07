@@ -1,0 +1,771 @@
+---
+title: "mlr3_for_lab"
+output: 
+ html_document:
+   toc: yes
+   toc_float: 
+    collapsed: true
+date: "2024-09-04"
+---
+
+```{r, warning=F, message=F}
+library(dplyr)
+library(ggplot2)
+library(sf) 
+library(mlr3)               # unified interface to machine learning algorithms
+library(mlr3learners)       # most important machine learning algorithms
+library(mlr3extralearners)  # access to even more learning algorithms
+library(mlr3spatiotempcv)   # spatio-temporal resampling strategies
+library(mlr3tuning)         # hyperparameter tuning
+library(mlr3tuningspaces)   # suggested hyperparameter tuning spaces
+library(paradox)            # manual hyperparameter tuning
+library(mlr3fselect)        # wrapper-based feature selection 
+library(mlr3viz)            # plotting functions for mlr3 objects
+library(mlr3mbo)            # bayesian hyperparameter tuning
+library(patchwork)          # combine plots
+library(mapview)            # for visualizing spatial data
+library(corrplot)           # correlation plot
+library(parallelly)          # parallel processing
+library(future)             # parallel processing
+
+```
+
+# R workflow
+
+## 1. Basic ML model
+
+### 1.1 Train - Validate - Test Splits
+
+In a basic ML workflow, we partition data into three sets: train, validate, and test. We build the model on a training set, use the validation set to optimize performance during model production, and use the test set to evaluate the final model.
+
+[![Lo Duca, 2023](data%20split.png){width="547"}](https://medium.com/syntaxerrorpub/understanding-the-difference-between-training-test-and-validation-sets-in-machine-learning-c59feec6483b)
+
+I'm going to use the "ecuador" data from the mlr3spatiotemp library. This dataset contains landslide information from Ecuador, 2000.
+
+```{r}
+data(ecuador)
+```
+
+First, I'll set aside a test set. There are lots of ways to decide this, but I'll show you the way I do this for my own work in the PPR. I start by creating a grid over the study area and then select a few grid cells as test areas. This approach lets me evaluate how well the model interpolates across space, and it allows me to compare performance throughout the region.
+
+```{r}
+# convert ecuador to an sf object
+ecuador_sf <- ecuador %>% 
+  st_as_sf(coords = c("x", "y"), crs = 32717) 
+
+# add a grid
+grid <- st_make_grid(ecuador_sf, n=6)
+
+# drop grid boxes with no data
+index <- which(lengths(st_intersects(grid, ecuador_sf)) > 0)
+grid_nonnull <- grid[index]
+
+# convert the grid to sf
+grid_sf <- grid_nonnull %>%  
+  st_as_sf() %>%
+  mutate(grid_id = row_number()) 
+```
+
+```{r, echo=F}
+# map of grid
+mapview(grid_sf,  alpha.regions = 0, legend=F) + 
+  mapview(ecuador_sf, cex=2, legend=F)
+```
+
+Then I manually determine the test and validation boxes. I try to spread them out, and I am for 15% in validation and 15% in testing.
+
+```{r, warning=F}
+# pick test boxes
+test_grid_ids <- c(3, 20, 23)
+
+# pick validation boxes 
+val_grid_ids <- c(6, 9, 16, 32)
+
+# add grid_id to ecuador data
+ecuador_sf <- st_join(ecuador_sf, grid_sf, join = st_intersects)
+
+# test set
+test <- ecuador_sf %>% filter(grid_id %in% test_grid_ids) 
+
+# validation set 
+val <- ecuador_sf %>% filter(grid_id %in% val_grid_ids) 
+
+# train set
+train <- ecuador_sf %>% filter(!(grid_id %in% c(test_grid_ids, val_grid_ids)))
+```
+
+```{r}
+# plot test vs train
+mapview(test, col.regions="blue", cex=3) + 
+  mapview(val, col.regions="green", cex=3) +
+  mapview(train, col.regions="orange", cex=3) + 
+  mapview(grid_sf,  alpha.regions = 0, legend=F) 
+```
+
+### 1.2 Tasks
+
+I start the mlr3 modeling process by specifying our task. The `target` is our response variable, which needs to be a factor variable type. `positive` is the target value for "true" in a binary classification task.
+
+```{r}
+# setup task
+task = train %>% 
+  st_drop_geometry() %>% 
+  as_task_classif(target = "slides", 
+                  positive = "TRUE")
+
+# vector of features + response variable names
+featureset <- colnames(ecuador)[c(1:7, 9:11)]
+
+# limit task to predictors
+task <- task$select(featureset)
+```
+
+### 1.3 Learners
+
+The second thing we need is an algorithm, or "learner". I'll use ranger, which is an implementation of Random Forest.
+
+Learners come from the `mlr3learners` and `mlr3extralearners` packages. You can explore available learners [here](https://mlr-org.com/learners.html), or by running `list_mlr3learners()` in R. To access the help page of a learner, you can run `lrn("classif.ranger")$help()` .
+
+```{r}
+# set learner
+lrn_basic = lrn("classif.ranger", predict_type = "prob")
+```
+
+### 1.4 Performance metrics
+
+We need a performance metric to optimize against. I'll use AUC, a common metric for classification models.
+
+To check out all performance metrics run `msrs()`.
+
+```{r}
+# measure to optimize
+msr = msr("classif.auc") 
+```
+
+Note, if we wanted to optimize against multiple measures, we could use `msrs(c("classif.tpr", "classif.tnr"))`.
+
+### 1.4 Running it
+
+Once a task is created, and the learner and performance metric have been chosen, we can now train our model and print its validation accuracy.
+
+```{r}
+set.seed(123)
+
+# train the learner
+lrn_basic$train(task)
+
+# predict on the test set
+pred = lrn_basic$predict_newdata(val)
+
+# print AUC
+pred$score(msr("classif.auc"))
+```
+
+At this point, we can adjust the model features or random forest hyperparameters based on the validation accuracy. Then, when it's looking good, see how it does on the test set.
+
+## 2. Cross-Validation
+
+### 2.1 Intro
+
+Validation accuracy in the basic workflow can be sensitive to how the data is split. For example, if we had estimated performance on a different longitude-based split, the AUC would have been different:
+
+```{r, echo=F, warning=F}
+# different train-validate split
+
+# pick validation boxes 
+val_grid_ids2 <- c(22, 15, 25)
+
+# validation set 
+val2 <- ecuador_sf %>% filter(grid_id %in% val_grid_ids2) 
+
+# train set
+train2 <- ecuador_sf %>% filter(!(grid_id %in% c(test_grid_ids, val_grid_ids2)))
+
+# plot test vs train
+mapview(test, col.regions="blue", cex=3) + 
+  mapview(val2, col.regions="green", cex=3) +
+  mapview(train2, col.regions="orange", cex=3) + 
+  mapview(grid_sf,  alpha.regions = 0, legend=F) 
+
+# setup task
+task2 = train2 %>% 
+    st_drop_geometry() %>% 
+    as_task_classif(target = "slides", 
+                    positive = "TRUE")
+
+# vector of features + response variable names
+featureset <- colnames(ecuador)[c(1:7, 9:11)]
+
+# limit task to predictors
+task2 <- task2$select(featureset)
+
+# set learner
+lrn_basic2 = lrn("classif.ranger", predict_type = "prob")
+
+# train the learner
+set.seed(123)
+lrn_basic2$train(task2)
+
+# predict on a different validation set
+pred = lrn_basic2$predict_newdata(val2)
+
+# print AUC
+pred$score(msr("classif.auc"))
+```
+
+A solution to this problem is a procedure called [*cross-validation*]{.underline} (CV). With CV, we repeat train/validation splits many times and average the results. This provides a more robust way to estimate the performance of our model in production.
+
+In the basic approach, called k-fold CV, the training set is split evenly into k subsets ("folds"). A model is trained on k-1 folds, and evaluated on the remaining fold. This process is repeated k times, with each fold serving as the validation set once, so that the model has a chance to learn from the entire training set.
+
+Pros:
+
+-   Does not waste as much data, which is a major advantage where the number of samples is very small
+
+-   Prevents overfitting, promoting model generalizability
+
+Cons:
+
+-   Can be computationally expensive
+
+Rules of thumb for determining k:
+
+-   k=5 or 10 is pretty common.
+
+-   Be careful not to choose a value of k that is too close to n (number of observations), as withholding too little data will make each model too similar, increasing estimation bias.
+
+[*Spatiotemporal CV*]{.underline} is a special type of CV where the folds are determined spatially and/or temporally. This is important when your goal is to make predictions in new locations or times. With random partitioning, the fundamental assumption of independence in CV is violated, and autocorrelation during training would inflate the accuracy of a potentially poor model. This is called “spatial overfitting.”
+
+[![From Lovelace et al., 2021.](Spatial%20Partioning.png)](https://r.geocompx.org/spatial-cv.html)\
+
+### 2.2 Resampling methods
+
+Now for CV, I also need to specify the resampling method. There are several resampling methods for spatial/temporal data. Descriptions can be found [here](https://arxiv.org/abs/2110.12674). I'll demonstrate 2 options for resampling folds with the ecuador data.
+
+**Option 1:** use the grid boxes (custom CV)
+
+One type of resampling relevant to spatiotemporal modeling is called *"leave-one-block-out CV"*. In LOBO-CV, the dataset is divided into distinct blocks (which could be based on space, time, or other factors). During each iteration, one block is held out as the validation set, while the remaining blocks are used for training the model. This process is repeated until each block has been used as the validation set once
+
+I'm going to use the grid boxes as blocks. However, we have 30 training + validation boxes, and that's probably too many. Instead of using leave-one-block-out, I'll hold out 3 blocks at a time. This will create 10 folds.
+
+```{r}
+# combine training and validation sets
+train_cv <- bind_rows(train, val)
+
+# train_cv
+train_cv <- train_cv %>% 
+  mutate(block =  ceiling(match(grid_id, unique(grid_id)) / 3))
+
+# setup task, using entire training + validation dataset
+task_cv <- train_cv %>% 
+    st_drop_geometry() %>% 
+    as_task_classif(target = "slides", 
+                    positive = "TRUE")
+
+# set learner
+lrn_cv = lrn("classif.ranger", predict_type = "prob")
+
+##### RESAMPLING STRATEGY 1 ##### 
+# instantiate leave-one-block-out resampling method
+task_cv$set_col_roles("block", add_to = "group")
+rsmp_lobo <- rsmp("loo")
+rsmp_lobo$instantiate(task_cv)
+
+# limit task to predictors
+task_cv <- task_cv$select(featureset)
+```
+
+Here's a visual of the 10 different custom folds
+
+```{r}
+# visualize LOBO block folds
+ggplot(train_cv) + 
+  geom_sf(aes(color=factor(block)))
+```
+
+Now that we have a task, learner, and resampling strategy, I can build the model and report the cross-validated accuracy.
+
+```{r}
+set.seed(123)
+
+# reduce verbosity
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+# run LOBO cross-validation 
+rr = resample(task = task_cv,
+              learner = lrn_cv,
+              resampling = rsmp_lobo)
+
+# compute the AUC as a data.table
+scores = rr$score(measure = msr("classif.auc"))
+
+# print the mean AUC across the 10 models
+mean(scores$classif.auc) 
+```
+
+**Option 2:**
+
+We could also tell the resampling strategy to repeat this random process, so that each time the splits are different. If I have 5-folds and 10 repetitions, I would create 50 models (5x10), and their average AUC will be my overall performance metric.
+
+```{r}
+# setup SPATIAL task, using entire training + validation dataset
+task_spcv <- train_cv %>% 
+    as_task_classif_st(target = "slides", 
+                       positive = "TRUE",
+                       coords_as_features = FALSE)
+
+# reset learner
+lrn_spcv = lrn("classif.ranger", predict_type = "prob")
+
+##### RESAMPLING STRATEGY 2 ##### 
+# specify coordinate-based resampling
+rsmp_spcv = rsmp("spcv_coords", folds = 10)
+
+# limit task to predictors
+task_spcv <- task_spcv$select(featureset)
+```
+
+Notice I don't drop the geometry from train_cv this time. We need the coordinates to perform the resampling.
+
+Here's a visual of the coordinate-based folds:
+
+```{r}
+# visualize coordinate-based folds
+autoplot(rsmp_spcv, task_spcv)
+```
+
+Now report CV accuracy:
+
+```{r, echo=F}
+set.seed(123)
+
+# reduce verbosity
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+# run LOBO cross-validation 
+rr = resample(task = task_spcv,
+              learner = lrn_spcv,
+              resampling = rsmp_spcv)
+
+# compute the AUC as a data.table
+scores = rr$score(measure = msr("classif.auc"))
+
+# print the mean AUC across the 10 models
+mean(scores$classif.auc) 
+```
+
+Cool. The CV accuracy is similar in both methods. This metric should reflect the model's true ability to generalize to new data. Note that **your resampling strategy is context-dependent**, and should be chosen with care.
+
+Great, so we've covered two strategies for assessing model accuracy in production: a basic train-validate split and cross-validation (CV). Let's move on to the actual model development process.
+
+## 3. Model Development
+
+### 3.1 Intro
+
+Model development consists of the following steps:
+
+1.  **Feature engineering** creating indices, encoding qualitative features, normalizing features, etc
+
+2.  **Feature selection** remove irrelevant, noisy, or redundant features
+
+3.  **Hyperparameter tuning**
+
+4.  **Algorithm selection** e.g. random forest vs XGBoost
+
+The first step occurs outside of the mlr3 ecosystem, while the remaining steps require validation to determine the best-performing model.
+
+Usually, you'd run feature selection first and then tune hyperparameters, possibly iterating over that process a couple of times. This approach could be a good choice for computational efficiency, especially if you have a large number of features and expect that many will be eliminated.
+
+### 3.2 Feature Selection
+
+There's a real art to feature selection. So many options. I think the key to just make sure you don't include obviously irrelevant, noisy, or redundant features.
+
+#### Importance metrics
+
+First, we need to adjust our learner so that it reports feature importance.
+
+To see importance methods for ranger, you can print:
+
+```{r}
+# print importance methods for ranger
+lrn("classif.ranger")$param_set$levels$importance
+```
+
+Let's use impurity,
+
+```{r}
+# reset learner so that it reports "impurity"
+lrn_rf = lrn("classif.ranger", predict_type = "prob", importance = "impurity")
+```
+
+Note that we're using the default hyperparameters for lrn_rf here. Just make sure these make enough sense to not be terrible choices, for now. That is, the hyperparameters shouldn't affect feature importance too much.
+
+#### Feature selection methods
+
+Now we need to choose a feature selection method. To list all available feature selection algorithms, run `as.data.table(mlr_fselectors)`.
+
+I'll use recursive feature elimination to select features. It's an efficient method, although not exhaustive. I'll actually use RFE-CV, where RFE is run for each resampling iteration, the optimal number of features is determined for each fold, and the average number of optimal features is computed. Finally, one more RFE is performed on the complete dataset, using the averaged feature set size.
+
+```{r}
+# recursive feature elimination 
+fselector = fs("rfecv",
+  feature_number = 1,      # 1 feature is removed in each elimination
+  n_features = 1)          # selection stops there's 1 feature left
+```
+
+#### Terminators
+
+Terminators tell you when to stop the feature selection process, within a given iteration. To check out all terminators, run `trms()`, or go [here](https://mlr-org.com/terminators.html).
+
+I started with an initial run of the feature selection process with no terminator. The performance plateaued after 4 features, but 8 were selected because of the tiny bump in performance those additional features offered.
+
+I decided I wanted to select only the most meaningful features. So instead, I use the stagnation terminator. This will stop feature selection within a given iteration when AUC improvement \< threshold.
+
+```{r}
+# no terminator
+trm = trm("none")
+```
+
+#### Running it
+
+The recursive feature elimination process will occur for each of the 10 resampling iterations, and the feature subset that performs best across all iterations (based on AUC) will be chosen.
+
+```{r, warning=F, message=F, results = 'hide'}
+set.seed(123)
+
+# set up the feature selection process
+instance = fsi(
+  task =  task_cv,
+  learner = lrn_rf,
+  resampling = rsmp_lobo,
+  measure = msr,
+  terminator = trm)
+
+# execute feature selection process (invisible suppresses output)
+invisible(fselector$optimize(instance))
+```
+
+Visualize how performance varies with the number of features:
+
+```{r, echo=F}
+# plot model performance vs n_features
+rfe_archive = as.data.table(instance$archive) 
+
+rfe_summary = rfe_archive %>% 
+   filter(!is.na(iteration)) %>% # within-fold metrics only
+   group_by(nfeat = unlist(n_features)) %>% 
+   summarize(y = mean(classif.auc))
+
+# plot average model performance vs n_features
+rfe_summary %>% 
+  ggplot(aes(x = nfeat, y = y)) +
+   geom_line() +
+   geom_point() +
+   geom_vline(
+     xintercept = rfe_summary[rfe_summary$y == max(rfe_summary$y), ]$nfeat,
+     linetype = "dashed") +
+   xlab("Number of Features") +
+   ylab("Mean AUC") +
+   theme_minimal() +
+   scale_x_reverse() 
+```
+
+The model is optimal when the number of features is 8. Here are the 8 features "selected" by this process:
+
+```{r}
+# print selected features
+instance$result_feature_set
+```
+
+Instead of using no terminator, we could use a stagnation terminator. This helps with efficiency, and tends to select a more parsimonious feature set. The downside is that we can't explore the performances of feature sets across folds (at least, I think).
+
+```{r, warning=F, message=F, results = 'hide'}
+set.seed(123)
+
+trm = trm("stagnation", threshold = 0.005) 
+
+# set up the feature selection process
+instance = fsi(
+  task =  task_cv,
+  learner = lrn_rf,
+  resampling = rsmp_lobo,
+  measure = msr,
+  terminator = trm)
+
+# execute feature selection process
+fselector$optimize(instance)
+```
+
+```{r}
+# print selected features
+instance$result_feature_set
+```
+
+I like the model with 6 features! Yeah model performance is a bit worse, but only a bit.
+
+We should also make sure no features are correlated.
+
+```{r, echo=F}
+cor <- ecuador %>% 
+  select(all_of(featureset)) %>% 
+  cor()
+
+corrplot(cor, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+Cool, the features aren't correlated. If they were, we'd wanna keep the obviously important features, drop correlated ones, and re-run feature selection until we're left with a list of uncorrelated features.
+
+While most of the ML algorithms we use implicitly perform feature selection (RF, XGBoost), it's generally considered best practice to have a more parsimonious model to avoid overfitting and reduce computational cost.
+
+Now, if we'd like, we can train the model on only the top 6 features:
+
+```{r}
+set.seed(123)
+
+selected_feats <- instance$result_feature_set
+
+# Subset task to optimized feature set
+task_cv$select(selected_feats)
+
+# reduce verbosity
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+# run LOBO cross-validation 
+rr = resample(task = task_cv,
+              learner = lrn_rf,
+              resampling = rsmp_lobo)
+
+# compute the AUC as a data.table
+scores = rr$score(measure = msr("classif.auc"))
+
+# print the mean AUC across the 10 models
+mean(scores$classif.auc) 
+```
+
+Cool, performance is bit better than the full-model cross-validated AUC of 0.668 (section 2.2).
+
+### 3.3 Hyperparameter Tuning
+
+Once we have the best feature subset, we can lock those features in place and proceed with hyperparameter tuning.
+
+```{r, echo=F}
+selected_feats <- c("carea", "cslope", "dem", "distslidespast", "log.carea", "slope") 
+```
+
+```{r}
+# Subset task to optimized feature set
+task_cv$select(selected_feats)
+```
+
+Note that the effect of tuning on model performance is more pronounced for certain algorithms than others. For example, SVM tends to benefit from tuning more than RF. It's generally understood that the impact of hyperparmeter tuning on predictive performance is less significant that the choice of algorithm and selection of features (Schratz et al., 2019).
+
+#### Tuning space
+
+First, I'll define the search space for hyperparameter tuning. Here's an example of how to define the space manually, using the `paradox` package.
+
+```{r, eval=F}
+# specify tuning space
+search_space = ps(
+  mtry = p_int(lower = 1, upper = ncol(task$data()) - 1),
+  sample.fraction = p_dbl(lower = 0.2, upper = 0.9)
+)
+```
+
+I can also use a default tuning space. These are retrieved with `lts()` (learner tuning space). To check out pre-set spaces, run `as.data.table(mlr3tuningspaces::mlr_tuning_spaces)`. The default tuning spaces are published in Bischl et al. (2023). Other tuning spaces are part of the random bot experiments rbv1 and rbv2 published in Kuehn et al. (2018) and Binder, Pfisterer, and Bischl (2020).
+
+I'll go with the default space for random forest.
+
+```{r}
+# specify default tuning space
+search_space = lts("classif.ranger.default")
+```
+
+#### Tuners
+
+Next, I'll specify the hyperparameter search method, or tuner. I'll go with a random search. This step requires the `mlr3tuning` package.
+
+Common search methods:
+
+-   Grid search: a grid of hyperparameter values is defined and the model is trained and evaluated for each combination of hyperparameters in the grid. Good for small tuning spaces, but inefficient for large ones.
+
+-   Random search: hyperparameters are randomly sampled from a specified distribution. Random search is usually a good choice as it outperforms grid search in high-dimensional settings (i.e. if a lot hyperparameters have to be optimized) and has no disadvantages in low-dimensional cases (Bergstra and Bengio 2012).
+
+-   Bayesian optimization: narrows down which hyperparameters to test based on past results. Adaptive search algorithms, like Bayesian optimization, offer computationally efficient solutions (`mlr3mbo` package)
+
+To check out all search methods, run `tnrs()`.
+
+Optional parameters (for certain tuners - not mbo) include resolution and batch_size, although default settings work well in most cases:
+
+-   resolution: \# of values to try per hyperparameter
+
+-   batch_size: \# of configurations to apply before the terminator checks if the termination criterion has been reached. This is also the number of configs to evaluate if parallelizing, and *may need manual adjustment*. This can get tricky, so check out the mlr3book ch10 for examples.
+
+```{r}
+# specify tuning search method
+tuner = tnr("random_search") 
+```
+
+#### Terminators
+
+Here I specify the number of hyperparameters configurations to try before stopping the optimization process. Alternatively, I could choose to terminate by time, or when a performance metric ("msr") threshold is met.
+
+`run_time` and `n_evals` are the most common terminators for tuning.
+
+```{r}
+# try 50 hyperparameters configs with a stagnation terminator
+terminator = trm("stagnation", iters=50, threshold=0.005)
+```
+
+#### Fallback Learner
+
+It's wise to set a backup learner too, in case our chosen method fails. This is recommended over ignoring failed iterations. `classif.featureless` simply chooses the majority class, without considering features. If our task was a regression, I'd use `regr.featureless`, which chooses the average response.
+
+```{r}
+# reset learner (if needed)
+lrn_rf = lrn("classif.ranger", predict_type = "prob", importance = "impurity")
+
+# specify fallback method for inner resampling
+lrn_rf$fallback = lrn("classif.featureless", predict_type = "prob")
+```
+
+#### Running it
+
+I'm going to run this one in parallel because it takes awhile. Running in parallel in the mlr3 environment is super simple (although to really optimize parallelization you'll wanna dig into the documentation).
+
+```{r}
+w = parallelly::availableCores() # our nucs have 20 cores
+future::plan("multisession", workers = w/2) # let's use half the available cores
+```
+
+```{r, results='hide'}
+set.seed(123)
+
+# initialize tuning instance
+instance = ti(
+  task = task_cv,
+  learner = lrn_rf,
+  resampling = rsmp_lobo, 
+  measures = msr,
+  terminator = terminator, 
+  search_space = search_space
+)
+
+# execute tuning process
+tuner$optimize(instance)
+```
+
+Now turn off parallelization
+
+```{r}
+future::plan("sequential")
+```
+
+Notice that the cross-validated AUC ranges 0.62 to 0.72, depending on the hyperparameter selection.
+
+```{r}
+instance$archive$data %>% as.data.frame() %>% summarize(min(classif.auc), max(classif.auc))
+```
+
+Let's see the selected hyperparameters:
+
+```{r}
+# print best hyperparameters
+selected_hp = instance$result_learner_param_vals
+selected_hp
+```
+
+Now, if we'd like, we can train the model on these hyperparameters:
+
+```{r}
+set.seed(123)
+
+# reset learner with optimal hyperparams
+lrn_rf_tuned = lrn("classif.ranger", 
+                    predict_type = "prob",
+                    mtry.ratio = selected_hp$mtry.ratio,
+                    num.trees = selected_hp$num.trees,
+                    sample.fraction = selected_hp$sample.fraction,
+                    replace = selected_hp$replace)
+
+# run LOBO cross-validation 
+rr = resample(task = task_cv,
+              learner = lrn_rf_tuned,
+              resampling = rsmp_lobo)
+
+# compute the AUC as a data.table
+scores = rr$score(measure = msr("classif.auc"))
+
+# print the mean AUC across the 10 models
+mean(scores$classif.auc) 
+```
+
+Wowie, the parsimonious model jumps from 0.67 to 0.72 AUC.
+
+
+
+# 4. Benchmarking
+
+The comparison between the plain CV and nested CV isn't quite apples-to-apples. For one, the former's resampling scheme used 5 folds repeated 10 times, while the later used 3-folds and no repeats. Secondly, how do we know the folds between the two were the same?
+
+```{r, eval=F}
+set.seed(123)
+
+# Plain CV with all 10 features
+lrn_rf = lrn("classif.ranger", predict_type = "prob")
+
+# specify resampling method
+rsmp_lobo$instantiate(task_spcv)
+rsmp_spcv$instantiate(task_spcv)
+
+# setup benchmark comparison(s)
+grid = benchmark_grid(task_spcv, 
+                      lrn_rf, 
+                      c(rsmp_lobo, rsmp_spcv))
+
+# train models
+bmr = benchmark(grid)
+
+# AUC of each method
+bmr$aggregate(msr("classif.auc"))[, c("learner_id", "classif.auc")]
+
+# classification error ("ce") of each method
+bmr$aggregate()[, .(task_id, learner_id, classif.ce)]
+
+# visualize classification accuracy
+mlr3viz::autoplot(bmr, measure = msr("classif.auc"))
+
+```
+
+# 6. Prediction
+
+The learner we use to make predictions on new data is called the final model. This model is trained with optimal features, and optimal hyperparameters on the full dataset.
+
+```{r, eval=F}
+# predict over our data
+autotuner$predict(task)
+
+# predict over a raster
+pred = terra::predict(ep, 
+                      model = autotuner, 
+                      fun = predict)
+```
+
+After evaluating your model with cross-validation, you should train your model on the full dataset to ensure it has seen all the data before making predictions.
+
+# References
+
+Bischl, Bernd, Martin Binder, Michel Lang, Tobias Pielok, Jakob Richter, Stefan Coors, Janek Thomas. “Hyperparameter Optimization: Foundations, Algorithms, Best Practices and Open Challenges.” *Wiley Interdisciplinary Reviews: Data Mining and Knowledge Discovery* (2023).
+
+B. Bischl, Bernd, O. Mersmann, H. Trautmann, C. Weihs. “Resampling Methods for Meta-Model Validation with Recommendations for Evolutionary Computation.” *Evol Comput* (2012): 20 (2): 249-275.
+
+Blancas, 2022
+
+mlr3book...
+
+R. Lovelace, J. Nowosad, and J. Muenchow. [Statistical Learning: Spatial CV](https://geocompr.robinlovelace.net/spatial-cv.html) (2021), Geocomputation with R.
+
+P. Schratz et al. "Hyperparameter tuning and performance assessment of statistical and machine-learning algorithms using spatial data." *Ecological Modelling* 406 (2019): 109-120.
+
+P. Schratz et al. "Mlr3spatiotempcv: Spatiotemporal resampling methods for machine learning in R." *ArXiv* 406 (2021): preprint.
+
+<https://ploomber.io/blog/nested-cv/>
