@@ -38,7 +38,7 @@ library(future)             # parallel processing
 
 In a basic ML workflow, we partition data into three sets: train, validate, and test. We build the model on a training set, use the validation set to optimize performance during model production, and use the test set to evaluate the final model.
 
-[![Lo Duca, 2023](data%20split.png){width="547"}](https://medium.com/syntaxerrorpub/understanding-the-difference-between-training-test-and-validation-sets-in-machine-learning-c59feec6483b)
+[![Lo Duca, 2023](figures/splits explanation.png)](https://medium.com/syntaxerrorpub/understanding-the-difference-between-training-test-and-validation-sets-in-machine-learning-c59feec6483b)
 
 I'm going to use the "ecuador" data from the mlr3spatiotemp library. This dataset contains landslide information from Ecuador, 2000.
 
@@ -235,7 +235,7 @@ Rules of thumb for determining k:
 
 [*Spatiotemporal CV*]{.underline} is a special type of CV where the folds are determined spatially and/or temporally. This is important when your goal is to make predictions in new locations or times. With random partitioning, the fundamental assumption of independence in CV is violated, and autocorrelation during training would inflate the accuracy of a potentially poor model. This is called “spatial overfitting.”
 
-[![From Lovelace et al., 2021.](Spatial%20Partioning.png)](https://r.geocompx.org/spatial-cv.html)\
+[![From Lovelace et al., 2021.](figures/spatial_partitioning.png)](https://r.geocompx.org/spatial-cv.html)\
 
 ### 2.2 Resampling methods
 
@@ -612,20 +612,21 @@ Here I specify the number of hyperparameters configurations to try before stoppi
 `run_time` and `n_evals` are the most common terminators for tuning.
 
 ```{r}
-# try 50 hyperparameters configs with a stagnation terminator
-terminator = trm("stagnation", iters=50, threshold=0.005)
+# try 30 hyperparameters configs with a stagnation terminator
+terminator = trm("stagnation", iters=30, threshold=0.005)
 ```
 
 #### Fallback Learner
 
 It's wise to set a backup learner too, in case our chosen method fails. This is recommended over ignoring failed iterations. `classif.featureless` simply chooses the majority class, without considering features. If our task was a regression, I'd use `regr.featureless`, which chooses the average response.
 
-```{r}
+```{r, eval=F}
 # reset learner (if needed)
 lrn_rf = lrn("classif.ranger", predict_type = "prob", importance = "impurity")
 
 # specify fallback method for inner resampling
-lrn_rf$fallback = lrn("classif.featureless", predict_type = "prob")
+# lrn_rf$set_fallback(lrn("classif.featureless", predict_type = "prob"))
+# lrn_rf$fallback = lrn("classif.featureless", predict_type = "prob")
 ```
 
 #### Running it
@@ -637,7 +638,7 @@ w = parallelly::availableCores() # our nucs have 20 cores
 future::plan("multisession", workers = w/2) # let's use half the available cores
 ```
 
-```{r, results='hide'}
+```{r, results='hide', eval=F}
 set.seed(123)
 
 # initialize tuning instance
@@ -662,13 +663,13 @@ future::plan("sequential")
 
 Notice that the cross-validated AUC ranges 0.62 to 0.72, depending on the hyperparameter selection.
 
-```{r}
+```{r, eval=F}
 instance$archive$data %>% as.data.frame() %>% summarize(min(classif.auc), max(classif.auc))
 ```
 
 Let's see the selected hyperparameters:
 
-```{r}
+```{r, eval=F}
 # print best hyperparameters
 selected_hp = instance$result_learner_param_vals
 selected_hp
@@ -676,7 +677,7 @@ selected_hp
 
 Now, if we'd like, we can train the model on these hyperparameters:
 
-```{r}
+```{r, eval=F}
 set.seed(123)
 
 # reset learner with optimal hyperparams
@@ -700,8 +701,6 @@ mean(scores$classif.auc)
 ```
 
 Wowie, the parsimonious model jumps from 0.67 to 0.72 AUC.
-
-
 
 # 4. Benchmarking
 
